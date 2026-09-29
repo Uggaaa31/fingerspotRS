@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+*.log
+logs/
+.git/
+.gitignore
+.venv/
+venv/
+*.md
+alembic/versions/*.py
