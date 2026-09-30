@@ -108,6 +108,16 @@ def format_command_response_body(body_value: Any) -> bytes:
     return prefix + json_bytes + b"\x00"
 
 
+def rewrite_enroll_payload_for_slave(raw_body: bytes) -> bytes:
+    parsed_json, binary_tail = extract_json_and_binary(raw_body)
+    if not parsed_json:
+        return raw_body
+    
+    parsed_json["cmd_code"] = "SET_ENROLL_DATA"
+    new_json_bytes = json.dumps(parsed_json, ensure_ascii=False).encode("utf-8")
+    new_prefix = struct.pack("<I", len(new_json_bytes))
+    return new_prefix + new_json_bytes + binary_tail
+
 async def handle_realtime_enroll_data(
     cur,
     source_device_sn: str,
@@ -209,6 +219,7 @@ async def handle_realtime_enroll_data(
     for (target_sn, loc) in target_devices:
         # A. Perintah SET_USER_INFO: Mendaftarkan PIN, Nama, dan Privilege ke mesin target
         user_info_payload = {
+            "cmd_code": "SET_USER_INFO",
             "user_id": raw_pin,
             "user_name": user_name if user_name else f"Pegawai {norm_pin}",
             "user_privilege": privilege,
@@ -231,7 +242,8 @@ async def handle_realtime_enroll_data(
         # B. Perintah SET_ENROLL_DATA: Mengirim template biometrik mentah ke mesin target
         # Mesin Fingerspot menerima format paket enroll yang sama persis seperti yang dikirim mesin sumber
         if raw_body:
-            b64_raw = base64.b64encode(raw_body).decode("ascii")
+            rewritten_body = rewrite_enroll_payload_for_slave(raw_body)
+            b64_raw = base64.b64encode(rewritten_body).decode("ascii")
             await cur.execute(
                 """
                 INSERT INTO adms_commands 
@@ -409,6 +421,7 @@ async def queue_sync_all_users_to_all_devices(cur) -> Dict[str, Any]:
         for (pin, name) in employees:
             clean_p = str(pin).strip()
             user_info = {
+                "cmd_code": "SET_USER_INFO",
                 "user_id": clean_p,
                 "user_name": name,
                 "user_privilege": 0,
@@ -433,7 +446,8 @@ async def queue_sync_all_users_to_all_devices(cur) -> Dict[str, Any]:
             try:
                 # Dekripsi template
                 decrypted_raw = cipher_suite.decrypt(enc_data.encode("utf-8"))
-                b64_raw = base64.b64encode(decrypted_raw).decode("ascii")
+                rewritten_body = rewrite_enroll_payload_for_slave(decrypted_raw)
+                b64_raw = base64.b64encode(rewritten_body).decode("ascii")
                 await cur.execute(
                     """
                     INSERT INTO adms_commands 
@@ -520,6 +534,7 @@ async def queue_sync_all_users_to_device(cur, target_device_sn: str) -> int:
     for (pin, name) in employees:
         clean_p = str(pin).strip()
         user_info = {
+            "cmd_code": "SET_USER_INFO",
             "user_id": clean_p,
             "user_name": name,
             "user_privilege": 0,
@@ -542,7 +557,8 @@ async def queue_sync_all_users_to_device(cur, target_device_sn: str) -> int:
     for (t_pin, f_id, t_type, enc_data) in templates:
         try:
             decrypted_raw = cipher_suite.decrypt(enc_data.encode("utf-8"))
-            b64_raw = base64.b64encode(decrypted_raw).decode("ascii")
+            rewritten_body = rewrite_enroll_payload_for_slave(decrypted_raw)
+            b64_raw = base64.b64encode(rewritten_body).decode("ascii")
             await cur.execute(
                 """
                 INSERT INTO adms_commands 
