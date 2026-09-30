@@ -589,10 +589,7 @@ function App() {
                 <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">NIP Pegawai</label>
                 <input type="text" required value={mapNip} onChange={e => setMapNip(e.target.value)} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-semibold text-slate-900 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" placeholder="Contoh: 19800101..." />
               </div>
-              <div>
-                <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">Nama Lengkap</label>
-                <input type="text" required value={mapName} onChange={e => setMapName(e.target.value)} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-semibold text-slate-900 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" placeholder="Contoh: dr. Budi" />
-              </div>
+
               <div className="flex gap-3 mt-4">
                 <button type="button" onClick={() => setIsModalOpen(false)} className="flex-1 py-2 bg-slate-100 text-slate-600 rounded-lg text-xs font-bold hover:bg-slate-200 transition-colors">Batal</button>
                 <button type="submit" className="flex-1 py-2 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 transition-colors shadow-sm">Simpan</button>

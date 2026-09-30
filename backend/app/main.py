@@ -677,18 +677,19 @@ async def save_pin_mapping(body: PinMappingBody):
     try:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                # 1. Periksa apakah user dengan NIP ini sudah ada di tabel users
-                await cur.execute("SELECT user_id FROM users WHERE employee_id_number = %s", (body.employee_nip,))
+                # 1. Periksa apakah user dengan NIP ini sudah ada di tabel users (SatuTalenta)
+                await cur.execute("SELECT user_id, display_name FROM users WHERE employee_id_number = %s", (body.employee_nip,))
                 row = await cur.fetchone()
                 if row:
                     user_id = row[0]
-                    await cur.execute("UPDATE users SET display_name = %s WHERE user_id = %s", (body.employee_name, user_id))
+                    # TIDAK MENGUBAH NAMA DI TABEL USERS karena sharing dengan SatuTalenta.
+                    # Kita ambil nama asli dari database untuk memastikan konsistensi.
+                    body.employee_name = row[1] 
                 else:
-                    await cur.execute(
-                        "INSERT INTO users (employee_id_number, display_name, department_id, is_active) VALUES (%s, %s, 1, 1)",
-                        (body.employee_nip, body.employee_name)
+                    return JSONResponse(
+                        status_code=400, 
+                        content={"error": f"NIP {body.employee_nip} tidak ditemukan di database SatuTalenta! Harap daftarkan pegawai di SatuTalenta terlebih dahulu."}
                     )
-                    user_id = cur.lastrowid
 
                 # 2. Masukkan ke pin_employee_map (baik pin asli maupun tanpa nol)
                 await cur.execute(
