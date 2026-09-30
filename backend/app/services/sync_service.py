@@ -340,7 +340,8 @@ async def handle_command_result(
         except ValueError:
             pass
 
-    status = "SUCCESS" if str(cmd_return_code).strip() in ("0", "OK") else f"FAILED_{cmd_return_code}"
+    status_str = "SUCCESS" if str(cmd_return_code).strip() in ("0", "OK") else f"FAILED_{cmd_return_code}"
+    status = status_str[:20]
 
     body_preview = ""
     if raw_body:

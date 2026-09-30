@@ -1,15 +1,67 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# docker-compose.yml — Fingerspot Real-Time ADMS Middleware Stack (MySQL Lokal)
-#
+# docker-compose.yml — Fingerspot Real-Time ADMS Middleware Stack
+# ─────────────────────────────────────────────────────────────────────────────
 # Services:
-#   1. db   — Database MySQL 8.0 (Lokal untuk pengujian)
-#   2. app  — FastAPI ADMS Real-Time Middleware
+#   1. backend  — FastAPI ADMS Real-Time Middleware (Python)
+#   2. frontend — React.js Dashboard UI (Nginx)
+#   3. db       — Database MySQL 8.0 (Lokal untuk pengujian)
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
 
-  # ── 1. MySQL Database (Opsional Lokal) ────────────────────
-  # Hanya dijalankan jika menggunakan flag --profile local-db
+  # ── 1. FastAPI ADMS Middleware (Backend) ────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: finger_adms_backend
+    restart: unless-stopped
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5005", "--reload"]
+    env_file:
+      - .env
+    environment:
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-adms_user}
+      DB_PASSWORD: ${DB_PASSWORD:-adms_password}
+      DB_NAME: ${DB_NAME:-presensi_local}
+      API_PORT: 5005
+    ports:
+      - "5005:5005"   # Port ADMS untuk koneksi dari mesin fisik
+    networks:
+      - finger_net
+    volumes:
+      - ./backend/app:/app/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── 2. React.js Dashboard UI (Frontend) ────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: finger_adms_frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"     # Akses UI di port 5173
+    networks:
+      - finger_net
+    depends_on:
+      - backend
+
+  # ── 3. MySQL Database (Opsional Lokal) ────────────────────
   db:
     image: mysql:8.0
     container_name: finger_mysql
@@ -24,7 +76,7 @@ services:
       - mysql_data:/var/lib/mysql
       - ./init_mysql.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
-      - "3307:3306"   # Expose ke host di port 3307 (menghindari konflik dengan MySQL Laragon di port 3306)
+      - "3307:3306"
     networks:
       - finger_net
     healthcheck:
@@ -32,47 +84,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 20s
-
-  # ── 2. FastAPI ADMS Middleware (Local Host -> Staging DB) ──
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: runtime
-    container_name: finger_adms_app
-    restart: unless-stopped
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "5005", "--reload"]
-    env_file:
-      - .env
-    environment:
-      DB_HOST: ${DB_HOST:-31.97.48.144}
-      DB_PORT: ${DB_PORT:-3306}
-      DB_USER: ${DB_USER:-staging}
-      DB_PASSWORD: ${DB_PASSWORD}
-      DB_NAME: ${DB_NAME:-presensi_staging}
-      API_PORT: ${API_PORT:-5005}
-    ports:
-      - "5005:5005"   # Port ADMS (sesuai setting mesin Fingerspot Revo)
-      - "7005:5005"   # Port default ADMS Revo WFV-208BNC
-      - "8000:5005"   # Port alternatif untuk akses dashboard/REST API
-    networks:
-      - finger_net
-    volumes:
-      - ./app:/app/app
-      - ./monitoring:/app/monitoring
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5005/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
       start_period: 20s
 
 # ── Volumes ───────────────────────────────────────────────────
