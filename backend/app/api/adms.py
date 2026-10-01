@@ -226,13 +226,32 @@ async def adms_receive_data(
                             slave_devices = await cur.fetchall()
 
                             for (slave_sn,) in slave_devices:
-                                cmd = f"DATA UPDATE FINGERTMP PIN={pin}\tFID={finger_id}\tSize={size}\tValid={valid}\tTMP={template}"
+                                # 1. Cari nama pegawai jika sudah terpetakan
+                                await cur.execute(
+                                    "SELECT u.display_name FROM pin_employee_map p JOIN users u ON p.employee_id = u.user_id WHERE p.pin = %s", 
+                                    (pin,)
+                                )
+                                user_row = await cur.fetchone()
+                                display_name = user_row[0] if user_row else f"Pegawai {pin}"
+
+                                # 2. Buat slot UserInfo terlebih dahulu di mesin slave
+                                cmd_user = f"DATA UPDATE USERINFO PIN={pin}\tName={display_name[:24]}\tPri=0\tGrp=1\tTZ=0001000100000000\tPIN2=0"
                                 await cur.execute(
                                     """
                                     INSERT INTO adms_commands (device_sn, command_text, expires_at)
                                     VALUES (%s, %s, %s)
                                     """,
-                                    (slave_sn, cmd, expires_at),
+                                    (slave_sn, cmd_user, expires_at),
+                                )
+
+                                # 3. Baru kirimkan template sidik jarinya
+                                cmd_finger = f"DATA UPDATE FINGERTMP PIN={pin}\tFID={finger_id}\tSize={size}\tValid={valid}\tTMP={template}"
+                                await cur.execute(
+                                    """
+                                    INSERT INTO adms_commands (device_sn, command_text, expires_at)
+                                    VALUES (%s, %s, %s)
+                                    """,
+                                    (slave_sn, cmd_finger, expires_at),
                                 )
 
                             saved_count += 1
@@ -269,9 +288,9 @@ async def _process_attendance_record(cur, pin: str, timestamp_str: str, status: 
     if row:
         user_id = row[0]
     else:
-        # Fallback: cari di tabel users (berdasarkan employee_id_number atau user_id langsung)
+        # Fallback: cari di tabel users (berdasarkan national_id_number atau user_id langsung)
         await cur.execute(
-            "SELECT user_id FROM users WHERE employee_id_number = %s OR user_id = %s LIMIT 1",
+            "SELECT user_id FROM users WHERE national_id_number = %s OR user_id = %s LIMIT 1",
             (pin, pin if pin.isdigit() else -1),
         )
         user_row = await cur.fetchone()
@@ -279,29 +298,8 @@ async def _process_attendance_record(cur, pin: str, timestamp_str: str, status: 
             user_id = user_row[0]
 
     if not user_id:
-        # AUTO-MAPPING: Jika belum terpetakan, daftarkan secara otomatis
-        norm_pin = str(pin).strip().lstrip("0") or "0"
-        disp_name = f"Pegawai PIN {norm_pin}"
-        
-        # 1. Buat user baru di tabel users
-        await cur.execute(
-            "INSERT INTO users (employee_id_number, display_name, department_id, is_active) VALUES (%s, %s, 1, 1)",
-            (norm_pin, disp_name)
-        )
-        user_id = cur.lastrowid
-        
-        # 2. Simpan mapping di tabel pin_employee_map (raw PIN dan normalized PIN)
-        await cur.execute(
-            "INSERT IGNORE INTO pin_employee_map (pin, employee_id) VALUES (%s, %s)",
-            (pin, user_id)
-        )
-        if norm_pin != pin:
-            await cur.execute(
-                "INSERT IGNORE INTO pin_employee_map (pin, employee_id) VALUES (%s, %s)",
-                (norm_pin, user_id)
-            )
-        
-        logger.info(f"[AUTO-MAPPING] PIN {pin} otomatis didaftarkan sebagai {disp_name}")
+        logger.info(f"[ATTENDANCE] PIN {pin} belum terpetakan ke pegawai manapun. Silakan petakan melalui Dashboard.")
+        return
 
     # 2. Logika Penentuan Tanggal Absensi (Shift Malam & Lintas Hari)
     target_date = att_date

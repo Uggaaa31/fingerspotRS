@@ -98,14 +98,15 @@ def format_command_response_body(body_value: Any) -> bytes:
         return body_value
 
     if isinstance(body_value, (dict, list)):
-        json_bytes = json.dumps(body_value, ensure_ascii=False).encode("utf-8")
+        json_str = json.dumps(body_value, ensure_ascii=False)
     elif isinstance(body_value, str):
-        json_bytes = body_value.encode("utf-8")
+        json_str = body_value
     else:
-        json_bytes = str(body_value).encode("utf-8")
+        json_str = str(body_value)
 
+    json_bytes = json_str.encode("utf-8") + b"\n\x00"
     prefix = struct.pack("<I", len(json_bytes))
-    return prefix + json_bytes + b"\x00"
+    return prefix + json_bytes
 
 
 def rewrite_enroll_payload_for_slave(raw_body: bytes) -> bytes:
@@ -114,6 +115,11 @@ def rewrite_enroll_payload_for_slave(raw_body: bytes) -> bytes:
         return raw_body
     
     parsed_json["cmd_code"] = "SET_ENROLL_DATA"
+    
+    # Revo WFV-208BNC dan firmware FkWeb BNC mewajibkan string "USER" atau "ADMIN"
+    priv_val = parsed_json.get("user_privilege", "USER")
+    parsed_json["user_privilege"] = "ADMIN" if str(priv_val).upper() in ["ADMIN", "14"] else "USER"
+    
     new_json_bytes = json.dumps(parsed_json, ensure_ascii=False).encode("utf-8")
     new_prefix = struct.pack("<I", len(new_json_bytes))
     return new_prefix + new_json_bytes + binary_tail
@@ -159,34 +165,27 @@ async def handle_realtime_enroll_data(
     # 1. Simpan / Perbarui Data Pegawai di DB Lokal
     # Periksa apakah user sudah ada
     await cur.execute(
-        "SELECT user_id, display_name FROM users WHERE employee_id_number = %s OR employee_id_number = %s LIMIT 1",
+        "SELECT user_id, display_name FROM users WHERE national_id_number = %s OR national_id_number = %s LIMIT 1",
         (raw_pin, norm_pin),
     )
     user_row = await cur.fetchone()
 
+    user_id = None
     if user_row:
         user_id = user_row[0]
-        # Perbarui nama jika mesin mengirimkan nama yang tidak kosong
-        if user_name and user_name != user_row[1]:
-            await cur.execute("UPDATE users SET display_name = %s WHERE user_id = %s", (user_name, user_id))
-    else:
-        disp_name = user_name if user_name else f"Pegawai PIN {norm_pin}"
-        await cur.execute(
-            "INSERT INTO users (employee_id_number, display_name, department_id, is_active) VALUES (%s, %s, 1, 1)",
-            (norm_pin, disp_name),
-        )
-        user_id = cur.lastrowid
+        # TIDAK MELAKUKAN UPDATE ATAU INSERT KE TABEL users KARENA MILIK SATUTALENTA
 
-    # Mapping PIN ke employee
-    await cur.execute(
-        "INSERT INTO pin_employee_map (pin, employee_id) VALUES (%s, %s) ON DUPLICATE KEY UPDATE employee_id = %s",
-        (raw_pin, user_id, user_id),
-    )
-    if norm_pin != raw_pin:
+    if user_id:
+        # Mapping PIN ke employee HANYA JIKA user_id ditemukan di database SatuTalenta
         await cur.execute(
             "INSERT INTO pin_employee_map (pin, employee_id) VALUES (%s, %s) ON DUPLICATE KEY UPDATE employee_id = %s",
-            (norm_pin, user_id, user_id),
+            (raw_pin, user_id, user_id),
         )
+        if norm_pin != raw_pin:
+            await cur.execute(
+                "INSERT INTO pin_employee_map (pin, employee_id) VALUES (%s, %s) ON DUPLICATE KEY UPDATE employee_id = %s",
+                (norm_pin, user_id, user_id),
+            )
 
     # 2. Simpan Template Biometrik Terenkripsi (UU PDP)
     if raw_body and len(raw_body) > 10:
@@ -218,12 +217,18 @@ async def handle_realtime_enroll_data(
 
     for (target_sn, loc) in target_devices:
         # A. Perintah SET_USER_INFO: Mendaftarkan PIN, Nama, dan Privilege ke mesin target
+        bnc_priv = "ADMIN" if str(privilege).upper() in ["ADMIN", "14"] else "USER"
         user_info_payload = {
             "cmd_code": "SET_USER_INFO",
             "user_id": raw_pin,
             "user_name": user_name if user_name else f"Pegawai {norm_pin}",
-            "user_privilege": privilege,
+            "user_privilege": bnc_priv,
         }
+        # Format ADMS standard untuk command_text (dibaca oleh adms.py / iclock)
+        # Mesin ZKTeco ADMS mewajibkan privilege berupa angka (0 = User, 14 = Admin)
+        adms_pri = 14 if str(privilege).upper() in ["ADMIN", "14"] else 0
+        adms_user_cmd = f"DATA UPDATE USERINFO PIN={raw_pin}\tName={user_info_payload['user_name'][:24]}\tPri={adms_pri}\tGrp=1\tTZ=0001000100000000\tPIN2=0"
+        
         await cur.execute(
             """
             INSERT INTO adms_commands 
@@ -233,7 +238,7 @@ async def handle_realtime_enroll_data(
             (
                 target_sn,
                 json.dumps(user_info_payload),
-                f"SET_USER_INFO PIN={raw_pin} Name={user_info_payload['user_name']}",
+                adms_user_cmd,
                 expires_at,
             ),
         )
@@ -244,6 +249,14 @@ async def handle_realtime_enroll_data(
         if raw_body:
             rewritten_body = rewrite_enroll_payload_for_slave(raw_body)
             b64_raw = base64.b64encode(rewritten_body).decode("ascii")
+            
+            # Ekstrak HANYA binary template murni tanpa header JSON untuk dikirim ke ADMS
+            _, binary_tail = extract_json_and_binary(raw_body)
+            
+            # Format ADMS standard untuk FINGERTMP
+            adms_finger_tmp = base64.b64encode(binary_tail).decode("ascii") if binary_tail else ""
+            adms_finger_cmd = f"DATA UPDATE FINGERTMP PIN={raw_pin}\tFID={backup_num}\tSize={len(binary_tail)}\tValid=1\tTMP={adms_finger_tmp}"
+
             await cur.execute(
                 """
                 INSERT INTO adms_commands 
@@ -253,8 +266,9 @@ async def handle_realtime_enroll_data(
                 (
                     target_sn,
                     b64_raw,
-                    f"SET_ENROLL_DATA PIN={raw_pin} Type={enroll_type} FID={backup_num}",
+                    adms_finger_cmd,
                     expires_at,
+
                 ),
             )
             queued_count += 1
@@ -424,7 +438,7 @@ async def queue_sync_all_users_to_all_devices(cur) -> Dict[str, Any]:
                 "cmd_code": "SET_USER_INFO",
                 "user_id": clean_p,
                 "user_name": name,
-                "user_privilege": 0,
+                "user_privilege": "USER",
             }
             await cur.execute(
                 """
@@ -537,7 +551,7 @@ async def queue_sync_all_users_to_device(cur, target_device_sn: str) -> int:
             "cmd_code": "SET_USER_INFO",
             "user_id": clean_p,
             "user_name": name,
-            "user_privilege": 0,
+            "user_privilege": "USER",
         }
         await cur.execute(
             """

@@ -3,6 +3,7 @@ app/main.py — Entry point FastAPI application (ADMS Middleware & Attendance AP
 """
 import logging
 import asyncio
+import struct
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
@@ -219,7 +220,7 @@ async def get_live_feed(
                         COALESCE(d.location, 'Fingerspot Mesin') AS location,
                         r.pin,
                         COALESCE(u.display_name, 'Belum Terpetakan') AS employee_name,
-                        COALESCE(u.employee_id_number, '-') AS employee_nip,
+                        COALESCE(u.national_id_number, '-') AS employee_nip,
                         r.timestamp,
                         r.status,
                         r.verify_mode,
@@ -234,8 +235,8 @@ async def get_live_feed(
                         pem.employee_id = u.user_id 
                         OR (
                             pem.employee_id IS NULL AND (
-                                r.pin = u.employee_id_number 
-                                OR (TRIM(LEADING '0' FROM r.pin) COLLATE utf8mb4_unicode_ci) = (TRIM(LEADING '0' FROM u.employee_id_number) COLLATE utf8mb4_unicode_ci)
+                                r.pin = u.national_id_number 
+                                OR (TRIM(LEADING '0' FROM r.pin) COLLATE utf8mb4_unicode_ci) = (TRIM(LEADING '0' FROM u.national_id_number) COLLATE utf8mb4_unicode_ci)
                                 OR (TRIM(LEADING '0' FROM r.pin) COLLATE utf8mb4_unicode_ci) = CAST(u.user_id AS CHAR)
                             )
                         )
@@ -323,6 +324,8 @@ async def get_live_feed(
                         "pin": pin_str,
                         "employee_name": r[4],
                         "employee_nip": r[5],
+                        "employee_nik": r[5],
+                        "national_id_number": r[5],
                         "timestamp": ts_str,
                         "status_code": status_code,
                         "status_label": status_label,
@@ -371,7 +374,7 @@ async def get_daily_attendance(
                         a.attendance_id,
                         a.user_id,
                         COALESCE(u.display_name, 'Belum Terpetakan') AS employee_name,
-                        COALESCE(u.employee_id_number, '-') AS employee_nip,
+                        COALESCE(u.national_id_number, '-') AS employee_nip,
                         COALESCE(MIN(pem.pin), CAST(u.user_id AS CHAR)) AS pin,
                         a.attendance_date,
                         a.checkin_time,
@@ -382,7 +385,7 @@ async def get_daily_attendance(
                     JOIN users u ON a.user_id = u.user_id
                     LEFT JOIN pin_employee_map pem ON a.user_id = pem.employee_id
                     WHERE a.attendance_date = %s
-                    GROUP BY a.attendance_id, a.user_id, u.display_name, u.employee_id_number, a.attendance_date, a.checkin_time, a.checkout_time, a.attendance_method, a.attendance_status
+                    GROUP BY a.attendance_id, a.user_id, u.display_name, u.national_id_number, a.attendance_date, a.checkin_time, a.checkout_time, a.attendance_method, a.attendance_status
 
                     UNION ALL
 
@@ -433,6 +436,8 @@ async def get_daily_attendance(
                         "user_id": r[1],
                         "employee_name": r[2],
                         "employee_nip": r[3],
+                        "employee_nik": r[3],
+                        "national_id_number": r[3],
                         "pin": str(r[4]).strip() if r[4] else "-",
                         "date": str(r[5]),
                         "checkin_time": cin,
@@ -488,7 +493,7 @@ async def export_daily_attendance(
     ws['A1'].alignment = center_align
 
     # Table Headers
-    headers = ["No", "NIP / NIK", "Nama Pegawai", "Jam Masuk", "Jam Pulang", "Durasi Kerja", "Metode", "Status"]
+    headers = ["No", "NIK (No. KTP)", "Nama Pegawai", "Jam Masuk", "Jam Pulang", "Durasi Kerja", "Metode", "Status"]
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=3, column=col, value=h)
         cell.fill = header_fill
@@ -499,7 +504,7 @@ async def export_daily_attendance(
     # Isi Data
     for row_idx, row_data in enumerate(data, 4):
         ws.cell(row=row_idx, column=1, value=row_idx - 3).alignment = center_align
-        ws.cell(row=row_idx, column=2, value=row_data.get("employee_nip", "-")).alignment = center_align
+        ws.cell(row=row_idx, column=2, value=row_data.get("national_id_number") or row_data.get("employee_nik") or row_data.get("employee_nip", "-")).alignment = center_align
         ws.cell(row=row_idx, column=3, value=row_data.get("employee_name", "-")).alignment = left_align
         ws.cell(row=row_idx, column=4, value=row_data.get("checkin_time", "-")).alignment = center_align
         ws.cell(row=row_idx, column=5, value=row_data.get("checkout_time", "-")).alignment = center_align
@@ -526,7 +531,7 @@ async def export_daily_attendance(
                     query_logs = """
                         SELECT 
                             r.timestamp, 
-                            COALESCE(u.employee_id_number, '-') AS employee_nip, 
+                            COALESCE(u.national_id_number, '-') AS employee_nip, 
                             COALESCE(u.display_name, 'Belum Terpetakan') AS employee_name,
                             r.status, 
                             COALESCE(d.location, 'Mesin Absensi') AS location
@@ -539,8 +544,8 @@ async def export_daily_attendance(
                             pem.employee_id = u.user_id 
                             OR (
                                 pem.employee_id IS NULL AND (
-                                    r.pin = u.employee_id_number 
-                                    OR (TRIM(LEADING '0' FROM r.pin) COLLATE utf8mb4_unicode_ci) = (TRIM(LEADING '0' FROM u.employee_id_number) COLLATE utf8mb4_unicode_ci)
+                                    r.pin = u.national_id_number 
+                                    OR (TRIM(LEADING '0' FROM r.pin) COLLATE utf8mb4_unicode_ci) = (TRIM(LEADING '0' FROM u.national_id_number) COLLATE utf8mb4_unicode_ci)
                                 )
                             )
                         )
@@ -559,7 +564,7 @@ async def export_daily_attendance(
     ws2['A1'].font = Font(bold=True, size=14)
     ws2['A1'].alignment = center_align
 
-    headers2 = ["No", "Waktu Tap", "NIP / NIK", "Nama Pegawai", "Status (Masuk/Pulang)", "Lokasi Mesin"]
+    headers2 = ["No", "Waktu Tap", "NIK (No. KTP)", "Nama Pegawai", "Status (Masuk/Pulang)", "Lokasi Mesin"]
     for col, h in enumerate(headers2, 1):
         cell = ws2.cell(row=3, column=col, value=h)
         cell.fill = PatternFill(start_color="3B82F6", end_color="3B82F6", fill_type="solid") # Warna Biru
@@ -605,12 +610,13 @@ from pydantic import BaseModel
 
 class PinMappingBody(BaseModel):
     pin: str
-    employee_name: str
-    employee_nip: str
+    employee_name: Optional[str] = ""
+    national_id_number: Optional[str] = None
+    employee_nip: Optional[str] = None # alias backwards-compat
 
 @app.get("/api/v1/pin-mapping", tags=["Monitoring"], summary="Daftar semua PIN dan status pemetaan")
 async def get_pin_mappings():
-    """Melihat daftar seluruh PIN yang terdeteksi dari mesin dan pegawai yang dipetakan."""
+    """Melihat daftar seluruh PIN yang terdeteksi dari mesin dan pegawai yang dipetakan berdasarkan NIK (national_id_number)."""
     pool = get_db_pool()
     if not pool:
         return JSONResponse(status_code=503, content={"error": "Database belum terhubung"})
@@ -623,7 +629,7 @@ async def get_pin_mappings():
                         r.pin,
                         TRIM(LEADING '0' FROM r.pin) AS norm_pin,
                         COALESCE(u.display_name, 'Belum Terpetakan') AS employee_name,
-                        COALESCE(u.employee_id_number, '-') AS employee_nip,
+                        COALESCE(u.national_id_number, '-') AS national_id_number,
                         COUNT(*) AS total_taps,
                         MAX(r.timestamp) AS last_tap
                     FROM raw_attendance r
@@ -635,12 +641,12 @@ async def get_pin_mappings():
                         pem.employee_id = u.user_id 
                         OR (
                             pem.employee_id IS NULL AND (
-                                r.pin = u.employee_id_number 
-                                OR (TRIM(LEADING '0' FROM r.pin) COLLATE utf8mb4_unicode_ci) = (TRIM(LEADING '0' FROM u.employee_id_number) COLLATE utf8mb4_unicode_ci)
+                                r.pin = u.national_id_number 
+                                OR (TRIM(LEADING '0' FROM r.pin) COLLATE utf8mb4_unicode_ci) = (TRIM(LEADING '0' FROM u.national_id_number) COLLATE utf8mb4_unicode_ci)
                             )
                         )
                     )
-                    GROUP BY r.pin, norm_pin, employee_name, employee_nip
+                    GROUP BY r.pin, norm_pin, employee_name, national_id_number
                     ORDER BY CAST(norm_pin AS UNSIGNED) ASC
                 """
                 await cur.execute(query)
@@ -652,6 +658,8 @@ async def get_pin_mappings():
                         "norm_pin": str(r[1]).strip(),
                         "employee_name": r[2],
                         "employee_nip": r[3],
+                        "employee_nik": r[3],
+                        "national_id_number": r[3],
                         "is_mapped": r[2] != "Belum Terpetakan",
                         "total_taps": r[4],
                         "last_tap": format_datetime(r[5]),
@@ -666,19 +674,23 @@ async def get_pin_mappings():
 
 @app.post("/api/v1/pin-mapping", tags=["Monitoring"], summary="Petakan PIN mesin ke Pegawai RSUP")
 async def save_pin_mapping(body: PinMappingBody):
-    """Menyimpan atau memperbarui pemetaan PIN mesin ke Nama & NIP Pegawai RSUP."""
+    """Menyimpan atau memperbarui pemetaan PIN mesin ke Nama & NIK (national_id_number) Pegawai RSUP."""
     pool = get_db_pool()
     if not pool:
         return JSONResponse(status_code=503, content={"error": "Database belum terhubung"})
 
     clean_pin = body.pin.strip()
     norm_pin = clean_pin.lstrip("0") or "0"
+    target_nik = (body.national_id_number or body.employee_nip or "").strip()
+
+    if not target_nik:
+        return JSONResponse(status_code=400, content={"error": "NIK Pegawai (national_id_number) wajib diisi!"})
 
     try:
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
-                # 1. Periksa apakah user dengan NIP ini sudah ada di tabel users (SatuTalenta)
-                await cur.execute("SELECT user_id, display_name FROM users WHERE employee_id_number = %s", (body.employee_nip,))
+                # 1. Periksa apakah user dengan NIK ini sudah ada di tabel users (SatuTalenta)
+                await cur.execute("SELECT user_id, display_name FROM users WHERE national_id_number = %s", (target_nik,))
                 row = await cur.fetchone()
                 if row:
                     user_id = row[0]
@@ -688,7 +700,7 @@ async def save_pin_mapping(body: PinMappingBody):
                 else:
                     return JSONResponse(
                         status_code=400, 
-                        content={"error": f"NIP {body.employee_nip} tidak ditemukan di database SatuTalenta! Harap daftarkan pegawai di SatuTalenta terlebih dahulu."}
+                        content={"error": f"NIK {target_nik} tidak ditemukan di database SatuTalenta! Harap daftarkan pegawai di SatuTalenta terlebih dahulu."}
                     )
 
                 # 2. Masukkan ke pin_employee_map (baik pin asli maupun tanpa nol)
@@ -702,8 +714,8 @@ async def save_pin_mapping(body: PinMappingBody):
                         (norm_pin, user_id, user_id)
                     )
 
-                logger.info(f"[PIN MAPPED] PIN={clean_pin}/{norm_pin} -> {body.employee_name} ({body.employee_nip})")
-                return {"status": "success", "message": f"PIN {clean_pin} berhasil dipetakan ke {body.employee_name}"}
+                logger.info(f"[PIN MAPPED] PIN={clean_pin}/{norm_pin} -> {body.employee_name} (NIK: {target_nik})")
+                return {"status": "success", "message": f"PIN {clean_pin} berhasil dipetakan ke {body.employee_name} (NIK: {target_nik})"}
     except Exception as e:
         logger.error(f"[API ERROR save_pin_mapping] {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -874,7 +886,7 @@ async def get_shift_schedule(
         async with pool.acquire() as conn:
             async with conn.cursor() as cur:
                 query = """
-                    SELECT uss.id, uss.user_id, u.display_name, u.employee_id_number,
+                    SELECT uss.id, uss.user_id, u.display_name, u.national_id_number,
                            uss.shift_id, s.shift_name, s.checkin_time, s.checkout_time,
                            s.is_next_day, uss.schedule_date
                     FROM user_shift_schedules uss
@@ -895,6 +907,8 @@ async def get_shift_schedule(
                         "user_id": r[1],
                         "employee_name": r[2],
                         "employee_nip": r[3],
+                        "employee_nik": r[3],
+                        "national_id_number": r[3],
                         "shift_id": r[4],
                         "shift_name": r[5],
                         "checkin_time": r[6],
@@ -1052,11 +1066,15 @@ async def root_universal_handler(request: Request):
 
                 # 2. Polling Perintah Mesin: receive_cmd
                 if req_code == "receive_cmd":
+                    if raw_body and len(raw_body) >= 4:
+                        j_len = struct.unpack("<I", raw_body[:4])[0]
+                        logger.info(f"[POLL {dev_id}] raw_len={len(raw_body)} j_len={j_len} tail_len={len(raw_body)-4-j_len} tail={raw_body[4+j_len:]!r}")
                     pending = await get_next_pending_command(cur, dev_id)
                     if pending:
                         logger.info(
                             f"[DISPATCH CMD] SN={dev_id} | Code={pending['cmd_code']} | Trans={pending['trans_id']} | Bytes={len(pending['body_bytes'])}"
                         )
+                        body_len = len(pending["body_bytes"])
                         return Response(
                             content=pending["body_bytes"],
                             status_code=200,
@@ -1065,7 +1083,9 @@ async def root_universal_handler(request: Request):
                                 "trans_id": pending["trans_id"],
                                 "cmd_code": pending["cmd_code"],
                                 "dev_id": dev_id,
-                                "Content-Length": str(len(pending["body_bytes"])),
+                                "Content-Length": str(body_len),
+                                "blk_no": "0",
+                                "blk_len": str(body_len),
                                 "Connection": "close",
                             },
                             media_type="application/octet-stream",
@@ -1086,6 +1106,10 @@ async def root_universal_handler(request: Request):
                 # 3. Laporan Hasil Eksekusi Perintah: send_cmd_result
                 if req_code == "send_cmd_result":
                     ret_code = headers.get("cmd_return_code") or "0"
+                    logger.warning(
+                        f"[CMD RESULT ACK RECEIVED] SN={dev_id} | trans_id={trans_id} | ret_code={ret_code} | "
+                        f"raw_body_len={len(raw_body)} | raw_body={decoded[:300]} | headers={dict(headers)}"
+                    )
                     await handle_command_result(cur, dev_id, trans_id, ret_code, raw_body)
                     return Response(
                         content=b"",
@@ -1196,8 +1220,8 @@ async def root_universal_handler(request: Request):
                                 await cur.execute(
                                     """
                                     SELECT user_id FROM users 
-                                    WHERE employee_id_number = %s 
-                                       OR employee_id_number = %s 
+                                    WHERE national_id_number = %s 
+                                       OR national_id_number = %s 
                                        OR user_id = %s 
                                     LIMIT 1
                                     """,
@@ -1321,155 +1345,6 @@ async def root_universal_handler(request: Request):
 
                     except Exception as e:
                         logger.error(f"[AUTO SYNC ATTENDANCE ERROR] {e}", exc_info=True)
-
-
-                        # Cari user_id berdasarkan PIN
-                        await cur.execute(
-                            "SELECT employee_id FROM pin_employee_map WHERE pin = %s OR TRIM(LEADING '0' FROM pin) = %s LIMIT 1",
-                            (pin, clean_pin),
-                        )
-                        map_row = await cur.fetchone()
-                        user_id = map_row[0] if map_row else None
-
-                        if not user_id:
-                            await cur.execute(
-                                """
-                                SELECT user_id FROM users 
-                                WHERE employee_id_number = %s 
-                                   OR employee_id_number = %s 
-                                   OR user_id = %s 
-                                LIMIT 1
-                                """,
-                                (pin, clean_pin, clean_pin if clean_pin.isdigit() else -1),
-                            )
-                            u_row = await cur.fetchone()
-                            user_id = u_row[0] if u_row else None
-
-                        if user_id:
-                            # [SHIFT-NIGHT] Tentukan attendance_date yang benar
-                            # Cek apakah pegawai ini punya jadwal shift malam kemarin
-                            # yang jam pulangnya hari ini (is_next_day=1)
-                            att_date = dt_obj.date()
-                            shift_id = None
-                            shift_checkin_str = None
-                            shift_is_next_day = False
-
-                            # Cek jadwal untuk HARI INI
-                            await cur.execute(
-                                """
-                                SELECT uss.shift_id, s.checkin_time, s.checkout_time, 
-                                       s.is_next_day, s.late_tolerance_minutes, s.requires_attendance
-                                FROM user_shift_schedules uss
-                                JOIN shifts s ON uss.shift_id = s.shift_id
-                                WHERE uss.user_id = %s AND uss.schedule_date = %s
-                                LIMIT 1
-                                """,
-                                (user_id, att_date),
-                            )
-                            shift_row = await cur.fetchone()
-
-                            if shift_row:
-                                shift_id = shift_row[0]
-                                shift_checkin_str = shift_row[1]
-                                shift_is_next_day = bool(shift_row[3])
-
-                            # Jika tidak ada jadwal hari ini, cek jadwal KEMARIN 
-                            # (untuk kasus tap pulang shift malam yang is_next_day=1)
-                            if not shift_row or (shift_row and not shift_row[5]):  # requires_attendance = 0
-                                yesterday = att_date - timedelta(days=1)
-                                await cur.execute(
-                                    """
-                                    SELECT uss.shift_id, s.checkin_time, s.checkout_time,
-                                           s.is_next_day, s.late_tolerance_minutes, s.requires_attendance
-                                    FROM user_shift_schedules uss
-                                    JOIN shifts s ON uss.shift_id = s.shift_id
-                                    WHERE uss.user_id = %s AND uss.schedule_date = %s AND s.is_next_day = 1
-                                    LIMIT 1
-                                    """,
-                                    (user_id, yesterday),
-                                )
-                                yday_shift = await cur.fetchone()
-                                if yday_shift and yday_shift[5]:  # requires_attendance = 1
-                                    # Tap pagi ini adalah bagian dari shift malam kemarin
-                                    # Periksa apakah jam tap masih dalam window shift malam (sebelum jam 14:00)
-                                    if dt_obj.hour < 14:
-                                        att_date = yesterday  # Attendance date = kemarin
-                                        shift_id = yday_shift[0]
-                                        shift_checkin_str = yday_shift[1]
-                                        shift_is_next_day = True
-                                        shift_row = yday_shift
-                                        logger.info(f"[SHIFT-MALAM] PIN={pin} tap jam {dt_obj.hour}:xx dianggap bagian dari shift malam {yesterday}")
-
-                            # [LATE-CALC] Hitung keterlambatan jika ada jadwal shift
-                            late_minutes = 0
-                            is_late = 0
-                            attendance_status = 'HADIR'
-                            tolerance = shift_row[4] if shift_row else 15
-
-                            if shift_checkin_str and not shift_is_next_day:
-                                # Hanya hitung keterlambatan untuk tap PERTAMA (check-in)
-                                await cur.execute(
-                                    "SELECT checkin_time FROM attendances WHERE user_id = %s AND attendance_date = %s",
-                                    (user_id, att_date),
-                                )
-                                existing_att = await cur.fetchone()
-                                if not existing_att:  # Ini adalah tap pertama (check-in)
-                                    try:
-                                        sched_cin = datetime.strptime(
-                                            f"{att_date} {shift_checkin_str}:00", "%Y-%m-%d %H:%M:%S"
-                                        )
-                                        diff_min = int((dt_obj - sched_cin).total_seconds() / 60)
-                                        if diff_min > tolerance:
-                                            late_minutes = diff_min - tolerance
-                                            is_late = 1
-                                            attendance_status = 'TL1' if late_minutes <= 30 else ('TL2' if late_minutes <= 60 else 'TL3')
-                                        logger.info(f"[LATE-CALC] PIN={pin} | Jadwal={shift_checkin_str} | Tap={dt_obj.strftime('%H:%M')} | Terlambat={late_minutes}m")
-                                    except Exception as e_late:
-                                        logger.warning(f"[LATE-CALC] Gagal hitung keterlambatan: {e_late}")
-
-                            # [UPSERT] Simpan / update tabel attendances
-                            await cur.execute(
-                                "SELECT attendance_id, checkin_time, checkout_time FROM attendances WHERE user_id = %s AND attendance_date = %s",
-                                (user_id, att_date),
-                            )
-                            att_ex = await cur.fetchone()
-
-                            if not att_ex:
-                                # Baris baru: tap ini adalah CHECK-IN
-                                await cur.execute(
-                                    """
-                                    INSERT INTO attendances 
-                                        (user_id, shift_id, attendance_date, checkin_time, checkout_time,
-                                         attendance_method, attendance_status, late_minutes, is_late, updated_at)
-                                    VALUES (%s, %s, %s, %s, %s, 'FINGER', %s, %s, %s, NOW())
-                                    """,
-                                    (
-                                        user_id, shift_id, att_date, dt_obj,
-                                        dt_obj if status == 1 else None,
-                                        attendance_status, late_minutes, is_late,
-                                    ),
-                                )
-                            else:
-                                att_id, cin_time, cout_time = att_ex
-                                if cin_time:
-                                    diff_sec = (dt_obj - cin_time).total_seconds()
-                                    # Update checkout_time jika tap ini lebih baru (Tap Terakhir = Pulang)
-                                    if diff_sec >= 30:  # grace period 30 detik min
-                                        if not cout_time or dt_obj >= cout_time:
-                                            working_min = max(0, int((dt_obj - cin_time).total_seconds() / 60))
-                                            await cur.execute(
-                                                """
-                                                UPDATE attendances 
-                                                SET checkout_time = %s, working_minutes = %s, updated_at = NOW()
-                                                WHERE attendance_id = %s
-                                                """,
-                                                (dt_obj, working_min, att_id),
-                                            )
-                                            logger.info(f"[CHECKOUT] PIN={pin} | Pulang={dt_obj.strftime('%H:%M')} | Durasi={working_min}m")
-
-                    except Exception as e:
-                        logger.error(f"[AUTO SYNC ATTENDANCE ERROR] {e}", exc_info=True)
-
 
     # Respon ACK standar Protokol EBKN / FkWeb:
     response_headers = {
@@ -1656,13 +1531,7 @@ async def retry_failed_commands():
 
 
 # ── REST API: Revoke Fingerprint Karyawan (SYNC-05) ───────────────────────────
-class _RevokeBody:
-    pin: str
-    reason: str = "Pencabutan biometrik oleh HR/IT"
-
-from pydantic import BaseModel as _RevokeModel
-
-class RevokeBody(_RevokeModel):
+class RevokeBody(BaseModel):
     pin: str
     reason: str = "Pencabutan biometrik oleh HR/IT"
 

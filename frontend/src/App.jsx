@@ -101,7 +101,7 @@ function App() {
       const res = await fetch(`${API_BASE}/api/v1/pin-mapping`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pin: mapPin, employee_name: mapName, employee_nip: mapNip })
+        body: JSON.stringify({ pin: mapPin, employee_name: mapName, national_id_number: mapNip, employee_nip: mapNip })
       });
       if (res.ok) {
         alert("Pemetaan berhasil disimpan!");
@@ -109,7 +109,8 @@ function App() {
         fetchMappings();
         fetchLiveFeed();
       } else {
-        alert("Gagal menyimpan pemetaan");
+        const errData = await res.json().catch(() => ({}));
+        alert(errData.error || errData.message || "Gagal menyimpan pemetaan");
       }
     } catch (err) { alert(err.message); }
   };
@@ -124,16 +125,16 @@ function App() {
     if (!searchQuery) return true;
     const q = searchQuery.toLowerCase();
     const name = (item.employee_name || "").toLowerCase();
-    const nip = (item.employee_nip || "").toLowerCase();
+    const nik = (item.national_id_number || item.employee_nik || item.employee_nip || "").toLowerCase();
     const loc = (item.location || "").toLowerCase();
-    return name.includes(q) || nip.includes(q) || loc.includes(q);
+    return name.includes(q) || nik.includes(q) || loc.includes(q);
   });
 
   const filteredMappings = pinMappings.filter(item => {
     const q = mappingSearchQuery.toLowerCase();
     const name = (item.employee_name || "").toLowerCase();
-    const nip = (item.employee_nip || "").toLowerCase();
-    return name.includes(q) || nip.includes(q);
+    const nik = (item.national_id_number || item.employee_nik || item.employee_nip || "").toLowerCase();
+    return name.includes(q) || nik.includes(q);
   });
 
   return (
@@ -420,7 +421,7 @@ function App() {
                                       <span className="text-sm font-bold text-slate-900">{item.employee_name}</span>
                                       {isNew && <span className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-blue-100 text-blue-700 border border-blue-200/50 animate-pulse">BARU</span>}
                                     </div>
-                                    <span className="text-[11px] font-medium text-slate-500">NIP: {item.employee_nip}</span>
+                                    <span className="text-[11px] font-medium text-slate-500">NIK: {item.national_id_number || item.employee_nik || item.employee_nip}</span>
                                   </div>
                                 </div>
                               </td>
@@ -470,7 +471,7 @@ function App() {
                       <label className="text-xs font-bold text-slate-600">Pilih Tanggal:</label>
                       <input type="date" value={summaryDate} onChange={e => setSummaryDate(e.target.value)} className="px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:border-blue-500" />
                     </div>
-                    <button onClick={() => window.open(`http://localhost:5005/api/v1/export-attendance?target_date=${summaryDate}`, '_blank')} className="flex items-center gap-2 text-xs font-bold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 px-4 py-2 rounded-lg transition-colors shadow-sm">
+                    <button onClick={() => window.open(`${API_BASE}/api/v1/export-attendance?target_date=${summaryDate}`, '_blank')} className="flex items-center gap-2 text-xs font-bold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 px-4 py-2 rounded-lg transition-colors shadow-sm">
                       <Download size={14}/> Ekspor Data (Excel)
                     </button>
                   </div>
@@ -479,7 +480,7 @@ function App() {
                       <thead>
                         <tr className="bg-slate-50 text-[10px] font-extrabold text-slate-500 uppercase tracking-widest">
                           <th className="py-3 px-4 w-12 text-center">No</th>
-                          <th className="py-3 px-4">Pegawai & NIP</th>
+                          <th className="py-3 px-4">Pegawai & NIK</th>
                           <th className="py-3 px-4">Jam Masuk</th>
                           <th className="py-3 px-4">Jam Pulang</th>
                           <th className="py-3 px-4">Durasi / Status</th>
@@ -492,7 +493,7 @@ function App() {
                             <td className="py-3 px-4">
                               <div className="flex flex-col">
                                 <span className="text-sm font-bold text-slate-900">{item.employee_name}</span>
-                                <span className="text-[11px] font-medium text-slate-500">NIP: {item.employee_nip}</span>
+                                <span className="text-[11px] font-medium text-slate-500">NIK: {item.national_id_number || item.employee_nik || item.employee_nip}</span>
                               </div>
                             </td>
                             <td className="py-3 px-4">
@@ -529,7 +530,7 @@ function App() {
                       <Search size={16} className="absolute left-3 top-3 text-slate-400"/>
                       <input 
                         type="text" 
-                        placeholder="Cari nama pegawai atau NIP..." 
+                        placeholder="Cari nama pegawai atau NIK..." 
                         className="w-full pl-9 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-medium placeholder:font-normal placeholder:text-slate-400"
                         value={mappingSearchQuery}
                         onChange={(e) => setMappingSearchQuery(e.target.value)}
@@ -556,13 +557,13 @@ function App() {
                             <h3 className="text-xl font-extrabold text-slate-900 tracking-tight mt-1">Data Pegawai Baru</h3>
                           )}
                           {isMapped ? (
-                            <p className="text-sm font-semibold text-slate-500 mt-1">NIP: {item.employee_nip}</p>
+                            <p className="text-sm font-semibold text-slate-500 mt-1">NIK: {item.national_id_number || item.employee_nik || item.employee_nip}</p>
                           ) : (
                             <p className="text-sm font-semibold text-slate-400 mt-1">Belum terhubung ke HRIS. (Kode Akses: {item.pin})</p>
                           )}
                         </div>
                         <button onClick={() => {
-                          setMapPin(item.pin); setMapName(isMapped ? item.employee_name : ''); setMapNip(isMapped ? item.employee_nip : ''); setIsModalOpen(true);
+                          setMapPin(item.pin); setMapName(isMapped ? item.employee_name : ''); setMapNip(isMapped ? (item.national_id_number || item.employee_nik || item.employee_nip) : ''); setIsModalOpen(true);
                         }} className={`mt-4 w-full py-2 rounded-lg text-xs font-bold transition-colors ${isMapped ? 'bg-slate-100 text-slate-700 hover:bg-slate-200' : 'bg-blue-600 text-white hover:bg-blue-700 shadow-sm'}`}>
                           {isMapped ? 'Edit Pegawai' : 'Memulai'}
                         </button>
@@ -581,13 +582,13 @@ function App() {
       {isModalOpen && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-900/40 backdrop-blur-sm p-4">
           <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-2xl border border-slate-200">
-            <h3 className="text-lg font-bold text-slate-900 mb-1">Edit Data Pegawai</h3>
-            <p className="text-xs font-medium text-slate-500 mb-5">Hubungkan ID dari mesin absensi dengan data pegawai di SIMRS.</p>
+            <h3 className="text-lg font-bold text-slate-900 mb-1">Edit Data Pegawai (NIK)</h3>
+            <p className="text-xs font-medium text-slate-500 mb-5">Hubungkan ID dari mesin absensi dengan Nomor Induk Kependudukan (NIK) pegawai.</p>
             <form onSubmit={handleSaveMapping} className="flex flex-col gap-4">
               <input type="hidden" value={mapPin} />
               <div>
-                <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">NIP Pegawai</label>
-                <input type="text" required value={mapNip} onChange={e => setMapNip(e.target.value)} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-semibold text-slate-900 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" placeholder="Contoh: 19800101..." />
+                <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider mb-1 block">NIK Pegawai (No. KTP)</label>
+                <input type="text" required value={mapNip} onChange={e => setMapNip(e.target.value)} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm font-semibold text-slate-900 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" placeholder="Contoh: 7371140405930006..." />
               </div>
 
               <div className="flex gap-3 mt-4">
