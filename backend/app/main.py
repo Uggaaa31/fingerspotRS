@@ -10,12 +10,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from app.config import settings
 from app.database import init_db_pool, close_db_pool, get_db_pool
 from app.api import adms
 from app.services.sync_service import queue_revoke_fingerprint, cleanup_old_commands
+from app.services.broadcaster import broadcaster
 
 # ── Logging Setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -296,8 +297,12 @@ async def get_live_feed(
                         v_label = "Sidik Jari"
                     elif v_code == 2:
                         v_label = "Wajah"
+                    elif v_code in (8, 9, 5, 2147483648):
+                        v_label = "Vena Telapak Tangan"
+                    elif v_code == 4 or v_code == 3:
+                        v_label = "Kartu RFID" if v_code == 4 else "Password/PIN"
                     elif v_code == 15:
-                        v_label = "Kartu RFID"
+                        v_label = "Wajah + FP"
                     else:
                         v_label = "Password/PIN"
 
@@ -347,6 +352,115 @@ async def get_live_feed(
     except Exception as e:
         logger.error(f"[API ERROR live-feed] {e}", exc_info=True)
         return JSONResponse(status_code=500, content={"error": str(e)})
+ 
+ 
+# ── Server-Sent Events (SSE): Real-Time Stream Presensi & Statistik ───────────
+@app.get("/api/v1/stream", tags=["Monitoring"], summary="Server-Sent Events (SSE) stream realtime")
+async def sse_attendance_stream(request: Request):
+    """
+    Koneksi real-time Server-Sent Events (SSE).
+    Mengalirkan event kehadiran (punch), perubahan status mesin, dan statistik hari ini
+    langsung ke browser tanpa perlu polling agresif 2.5 detik.
+    """
+    import json
+    queue = await broadcaster.subscribe()
+
+    async def event_generator():
+        try:
+            # 1. Kirim event handshake saat pertama kali terhubung
+            pool = get_db_pool()
+            init_stats = None
+            if pool:
+                try:
+                    async with pool.acquire() as conn:
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                SELECT 
+                                    COUNT(*), 
+                                    COALESCE(SUM(CASE WHEN status = 0 THEN 1 ELSE 0 END), 0),
+                                    COALESCE(SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END), 0)
+                                FROM raw_attendance 
+                                WHERE DATE(received_at) = CURRENT_DATE() OR DATE(timestamp) = CURRENT_DATE()
+                                """
+                            )
+                            st = await cur.fetchone()
+                            await cur.execute("SELECT COUNT(*) FROM devices WHERE last_seen_at >= NOW() - INTERVAL 15 MINUTE")
+                            onl = await cur.fetchone()
+                            init_stats = {
+                                "total_today": int(st[0]) if st and st[0] else 0,
+                                "checkin_today": int(st[1]) if st and st[1] else 0,
+                                "checkout_today": int(st[2]) if st and st[2] else 0,
+                                "online_devices": int(onl[0]) if onl and onl[0] else 0,
+                            }
+                except Exception as e_st:
+                    logger.warning(f"[SSE] Gagal query statistik awal: {e_st}")
+
+            welcome_payload = {
+                "event": "connected",
+                "message": "Fingerspot Real-Time SSE Connected",
+                "active_listeners": broadcaster.count(),
+                "stats": init_stats,
+                "timestamp": datetime.now().isoformat(),
+            }
+            yield f"data: {json.dumps(welcome_payload)}\n\n"
+
+            # 2. Loop streaming event & ping keep-alive (15s timeout)
+            while True:
+                if await request.is_disconnected():
+                    logger.info("[SSE] Klien menutup koneksi stream.")
+                    break
+
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(msg)}\n\n"
+                except asyncio.TimeoutError:
+                    # Keep-alive comment syntax agar firewall/browser tidak timeout
+                    yield f": ping - {datetime.now().strftime('%H:%M:%S')}\n\n"
+        except asyncio.CancelledError:
+            pass
+        except Exception as e_stream:
+            logger.error(f"[SSE] Stream exception: {e_stream}")
+        finally:
+            await broadcaster.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Content-Type": "text/event-stream; charset=utf-8",
+        },
+    )
+
+
+@app.post("/api/v1/simulate-punch", tags=["Monitoring"], summary="Simulasi tap presensi untuk pengujian SSE")
+async def simulate_punch(
+    pin: str = Query(..., description="PIN pegawai"),
+    device_sn: str = Query("DEV_SIMULATOR", description="SN mesin simulasi"),
+    status: int = Query(0, description="0=Masuk, 1=Pulang"),
+    verify_mode: int = Query(1, description="1=FP, 2=Face, 15=Card"),
+):
+    """Endpoint utilitas untuk menguji streaming realtime SSE secara terprogram."""
+    from app.services.attendance_service import process_attendance_record
+    pool = get_db_pool()
+    if not pool:
+        return JSONResponse(status_code=503, content={"error": "Database belum terhubung"})
+
+    now_dt = datetime.now()
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            res = await process_attendance_record(
+                cur=cur,
+                device_sn=device_sn,
+                pin=pin,
+                timestamp_str_or_dt=now_dt,
+                status=status,
+                verify_mode=verify_mode,
+            )
+            return {"status": "success", "result": res}
 
 
 # ── REST API: Rekap Presensi Harian Terkonsolidasi (SatuTalenta RSUP) ─────────
@@ -380,12 +494,23 @@ async def get_daily_attendance(
                         a.checkin_time,
                         a.checkout_time,
                         a.attendance_method,
-                        a.attendance_status
+                        a.attendance_status,
+                        COALESCE(a.late_minutes, 0) AS late_minutes,
+                        a.late_level,
+                        COALESCE(a.early_leave_minutes, 0) AS early_leave_minutes,
+                        a.early_leave_level,
+                        COALESCE(a.working_minutes, 0) AS working_minutes,
+                        COALESCE(s.shift_name, 'Reguler') AS shift_name,
+                        COALESCE(s.shift_code, 'REG') AS shift_code
                     FROM attendances a
                     JOIN users u ON a.user_id = u.user_id
                     LEFT JOIN pin_employee_map pem ON a.user_id = pem.employee_id
+                    LEFT JOIN shifts s ON a.shift_id = s.shift_id
                     WHERE a.attendance_date = %s
-                    GROUP BY a.attendance_id, a.user_id, u.display_name, u.national_id_number, a.attendance_date, a.checkin_time, a.checkout_time, a.attendance_method, a.attendance_status
+                    GROUP BY a.attendance_id, a.user_id, u.display_name, u.national_id_number, a.attendance_date, 
+                             a.checkin_time, a.checkout_time, a.attendance_method, a.attendance_status,
+                             a.late_minutes, a.late_level, a.early_leave_minutes, a.early_leave_level, 
+                             a.working_minutes, s.shift_name, s.shift_code
 
                     UNION ALL
 
@@ -399,7 +524,14 @@ async def get_daily_attendance(
                         MIN(r.timestamp) AS checkin_time,
                         CASE WHEN COUNT(*) > 1 AND MAX(r.timestamp) > MIN(r.timestamp) THEN MAX(r.timestamp) ELSE NULL END AS checkout_time,
                         'FINGER' AS attendance_method,
-                        'Belum Dipetakan' AS attendance_status
+                        'Belum Dipetakan' AS attendance_status,
+                        0 AS late_minutes,
+                        NULL AS late_level,
+                        0 AS early_leave_minutes,
+                        NULL AS early_leave_level,
+                        0 AS working_minutes,
+                        '-' AS shift_name,
+                        '-' AS shift_code
                     FROM raw_attendance r
                     LEFT JOIN pin_employee_map pem ON (
                         r.pin = pem.pin 
@@ -421,7 +553,6 @@ async def get_daily_attendance(
                     duration_str = "-"
                     if r[6] and r[7]:
                         try:
-                            # Parse datetime if needed
                             d_in = r[6] if isinstance(r[6], datetime) else datetime.strptime(str(r[6])[:19], "%Y-%m-%d %H:%M:%S")
                             d_out = r[7] if isinstance(r[7], datetime) else datetime.strptime(str(r[7])[:19], "%Y-%m-%d %H:%M:%S")
                             diff = d_out - d_in
@@ -430,6 +561,17 @@ async def get_daily_attendance(
                             duration_str = f"{int(hours)}j {int(minutes)}m"
                         except Exception:
                             pass
+
+                    late_min = r[10] or 0
+                    late_lvl = r[11]
+                    late_desc = f"{late_min}m ({late_lvl})" if late_lvl else ("Tepat Waktu" if cin != "-" else "-")
+
+                    early_min = r[12] or 0
+                    early_lvl = r[13]
+                    early_desc = f"{early_min}m ({early_lvl})" if early_lvl else ("Sesuai Jadwal" if cout != "-" else "-")
+
+                    working_min = r[14] or 0
+                    dur_str = f"{working_min // 60}j {working_min % 60}m" if working_min > 0 else duration_str
 
                     data.append({
                         "attendance_id": r[0],
@@ -442,9 +584,18 @@ async def get_daily_attendance(
                         "date": str(r[5]),
                         "checkin_time": cin,
                         "checkout_time": cout,
-                        "duration": duration_str,
+                        "duration": dur_str,
                         "method": r[8],
                         "status": r[9],
+                        "late_minutes": late_min,
+                        "late_level": late_lvl,
+                        "late_desc": late_desc,
+                        "early_leave_minutes": early_min,
+                        "early_leave_level": early_lvl,
+                        "early_leave_desc": early_desc,
+                        "working_minutes": working_min,
+                        "shift_name": r[15],
+                        "shift_code": r[16],
                     })
 
                 return {"date": target_date, "total": len(data), "data": data}
@@ -487,13 +638,16 @@ async def export_daily_attendance(
     thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
 
     # Title Header
-    ws.merge_cells('A1:H1')
+    ws.merge_cells('A1:K1')
     ws['A1'] = f"REKAP PRESENSI HARIAN RSUP - TANGGAL: {target_date}"
     ws['A1'].font = Font(bold=True, size=14)
     ws['A1'].alignment = center_align
 
     # Table Headers
-    headers = ["No", "NIK (No. KTP)", "Nama Pegawai", "Jam Masuk", "Jam Pulang", "Durasi Kerja", "Metode", "Status"]
+    headers = [
+        "No", "NIK / NIP", "Nama Pegawai", "Shift", "Jam Masuk", 
+        "Keterlambatan", "Jam Pulang", "Pulang Cepat", "Durasi Kerja", "Metode", "Status"
+    ]
     for col, h in enumerate(headers, 1):
         cell = ws.cell(row=3, column=col, value=h)
         cell.fill = header_fill
@@ -506,18 +660,21 @@ async def export_daily_attendance(
         ws.cell(row=row_idx, column=1, value=row_idx - 3).alignment = center_align
         ws.cell(row=row_idx, column=2, value=row_data.get("national_id_number") or row_data.get("employee_nik") or row_data.get("employee_nip", "-")).alignment = center_align
         ws.cell(row=row_idx, column=3, value=row_data.get("employee_name", "-")).alignment = left_align
-        ws.cell(row=row_idx, column=4, value=row_data.get("checkin_time", "-")).alignment = center_align
-        ws.cell(row=row_idx, column=5, value=row_data.get("checkout_time", "-")).alignment = center_align
-        ws.cell(row=row_idx, column=6, value=row_data.get("duration", "-")).alignment = center_align
-        ws.cell(row=row_idx, column=7, value=row_data.get("method", "-")).alignment = center_align
-        ws.cell(row=row_idx, column=8, value=row_data.get("status", "-")).alignment = center_align
+        ws.cell(row=row_idx, column=4, value=row_data.get("shift_name", "-")).alignment = center_align
+        ws.cell(row=row_idx, column=5, value=row_data.get("checkin_time", "-")).alignment = center_align
+        ws.cell(row=row_idx, column=6, value=row_data.get("late_desc", "-")).alignment = center_align
+        ws.cell(row=row_idx, column=7, value=row_data.get("checkout_time", "-")).alignment = center_align
+        ws.cell(row=row_idx, column=8, value=row_data.get("early_leave_desc", "-")).alignment = center_align
+        ws.cell(row=row_idx, column=9, value=row_data.get("duration", "-")).alignment = center_align
+        ws.cell(row=row_idx, column=10, value=row_data.get("method", "-")).alignment = center_align
+        ws.cell(row=row_idx, column=11, value=row_data.get("status", "-")).alignment = center_align
 
         # Apply border to all cells in the row
-        for col in range(1, 9):
+        for col in range(1, 12):
             ws.cell(row=row_idx, column=col).border = thin_border
 
     # Atur Lebar Kolom
-    column_widths = {'A': 5, 'B': 22, 'C': 35, 'D': 22, 'E': 22, 'F': 15, 'G': 15, 'H': 20}
+    column_widths = {'A': 5, 'B': 22, 'C': 35, 'D': 18, 'E': 20, 'F': 18, 'G': 20, 'H': 18, 'I': 16, 'J': 12, 'K': 15}
     for col, width in column_widths.items():
         ws.column_dimensions[col].width = width
 
@@ -1000,6 +1157,7 @@ from app.services.sync_service import (
     queue_sync_all_users_to_device,
     queue_time_sync,
 )
+from app.services.attendance_service import process_attendance_record
 
 @app.api_route("/", methods=["GET", "POST", "HEAD"], tags=["ADMS Protocol"], include_in_schema=False)
 @app.api_route("/hdata.aspx", methods=["GET", "POST", "HEAD"], tags=["ADMS Protocol"], include_in_schema=False)
@@ -1167,184 +1325,42 @@ async def root_universal_handler(request: Request):
                     else:
                         status = 0
 
-                    # Verifikasi: 1879048192 (0x70000000) atau 2 = Wajah, 1 = Sidik Jari
+                    # Verifikasi Revo WFV-208BNC: Palm Vein, Wajah, Sidik Jari, Kartu RFID, PIN
                     v_mode = parsed.get("verify_mode", 1)
-                    if v_mode in (2, 1879048192):
+                    if v_mode in (8, 9, 5, 2147483648):  # Palm Vein (0x80000000)
+                        verify_mode = 8
+                        method_str = "PALM"
+                    elif v_mode in (2, 1879048192):  # Wajah (0x70000000)
                         verify_mode = 2
-                    elif v_mode == 15:
+                        method_str = "FACE"
+                    elif v_mode == 4:  # Kartu RFID 125kHz
+                        verify_mode = 4
+                        method_str = "CARD"
+                    elif v_mode == 3:  # Password / PIN
+                        verify_mode = 3
+                        method_str = "PASSWORD"
+                    elif v_mode == 15:  # Wajah + FP Kombinasi
                         verify_mode = 15
-                    else:
+                        method_str = "FACE"
+                    else:  # Default Sidik Jari
                         verify_mode = 1
+                        method_str = "FINGER"
 
-                # 6. Simpan tap absensi ke database jika pin & ts_str valid
+                # 6. Simpan & proses tap absensi terpadu (Attendance Service RSUP)
                 if pin and ts_str:
-                    logger.info(f"[SUCCESS PARSED TAP] Mesin={dev_id} | PIN={pin} | Waktu={ts_str} | Status={'Masuk' if status==0 else 'Pulang'} | Verif={verify_mode}")
-                    await cur.execute(
-                        """
-                        INSERT INTO raw_attendance 
-                            (device_sn, pin, timestamp, status, verify_mode)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON DUPLICATE KEY UPDATE received_at = received_at
-                        """,
-                        (dev_id, pin, ts_str, status, verify_mode),
-                    )
-
-                    # ── Smart Attendance Upsert dengan Logika Shift ────────────────────
+                    logger.info(f"[SUCCESS PARSED TAP] Mesin={dev_id} | PIN={pin} | Waktu={ts_str} | Status={'Masuk' if status==0 else 'Pulang'} | Verif={verify_mode} ({method_str})")
                     try:
-                        dt_obj = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                        clean_pin = pin.lstrip("0") or "0"
-
-                        # [GRACE-PERIOD] Cek apakah tap ini adalah duplikat dalam 5 detik dari mesin lain
-                        await cur.execute(
-                            """
-                            SELECT id FROM raw_attendance 
-                            WHERE pin = %s AND device_sn != %s
-                              AND ABS(TIMESTAMPDIFF(SECOND, timestamp, %s)) <= 5
-                            LIMIT 1
-                            """,
-                            (pin, dev_id, ts_str),
+                        await process_attendance_record(
+                            cur=cur,
+                            device_sn=dev_id,
+                            pin=pin,
+                            timestamp_str_or_dt=ts_str,
+                            status=status,
+                            verify_mode=verify_mode,
+                            attendance_method=method_str,
                         )
-                        is_duplicate = await cur.fetchone()
-                        if is_duplicate:
-                            logger.info(f"[GRACE-PERIOD] Tap duplikat dalam 5 detik diabaikan: PIN={pin}")
-                        else:
-                            # Cari user_id berdasarkan PIN
-                            await cur.execute(
-                                "SELECT employee_id FROM pin_employee_map WHERE pin = %s OR TRIM(LEADING '0' FROM pin) = %s LIMIT 1",
-                                (pin, clean_pin),
-                            )
-                            map_row = await cur.fetchone()
-                            user_id = map_row[0] if map_row else None
-
-                            if not user_id:
-                                await cur.execute(
-                                    """
-                                    SELECT user_id FROM users 
-                                    WHERE national_id_number = %s 
-                                       OR national_id_number = %s 
-                                       OR user_id = %s 
-                                    LIMIT 1
-                                    """,
-                                    (pin, clean_pin, clean_pin if clean_pin.isdigit() else -1),
-                                )
-                                u_row = await cur.fetchone()
-                                user_id = u_row[0] if u_row else None
-
-                            if user_id:
-                                # [SHIFT-NIGHT] Tentukan attendance_date yang benar
-                                att_date = dt_obj.date()
-                                shift_id = None
-                                shift_checkin_str = None
-                                shift_is_next_day = False
-                                shift_row = None
-
-                                # Cek jadwal shift untuk HARI INI
-                                await cur.execute(
-                                    """
-                                    SELECT uss.shift_id, s.checkin_time, s.checkout_time, 
-                                           s.is_next_day, s.late_tolerance_minutes, s.requires_attendance
-                                    FROM user_shift_schedules uss
-                                    JOIN shifts s ON uss.shift_id = s.shift_id
-                                    WHERE uss.user_id = %s AND uss.schedule_date = %s
-                                    LIMIT 1
-                                    """,
-                                    (user_id, att_date),
-                                )
-                                shift_row = await cur.fetchone()
-
-                                if shift_row:
-                                    shift_id = shift_row[0]
-                                    shift_checkin_str = shift_row[1]
-                                    shift_is_next_day = bool(shift_row[3])
-
-                                # Cek jadwal KEMARIN — untuk tap pulang shift malam (is_next_day=1)
-                                if not shift_row or (shift_row and not shift_row[5]):
-                                    yesterday = att_date - timedelta(days=1)
-                                    await cur.execute(
-                                        """
-                                        SELECT uss.shift_id, s.checkin_time, s.checkout_time,
-                                               s.is_next_day, s.late_tolerance_minutes, s.requires_attendance
-                                        FROM user_shift_schedules uss
-                                        JOIN shifts s ON uss.shift_id = s.shift_id
-                                        WHERE uss.user_id = %s AND uss.schedule_date = %s AND s.is_next_day = 1
-                                        LIMIT 1
-                                        """,
-                                        (user_id, yesterday),
-                                    )
-                                    yday_shift = await cur.fetchone()
-                                    if yday_shift and yday_shift[5] and dt_obj.hour < 14:
-                                        att_date = yesterday
-                                        shift_id = yday_shift[0]
-                                        shift_checkin_str = yday_shift[1]
-                                        shift_is_next_day = True
-                                        shift_row = yday_shift
-                                        logger.info(f"[SHIFT-MALAM] PIN={pin} tap {dt_obj.strftime('%H:%M')} = bagian shift malam {yesterday}")
-
-                                # [LATE-CALC] Hitung keterlambatan dari jadwal shift
-                                late_minutes = 0
-                                is_late = 0
-                                attendance_status = 'HADIR'
-                                tolerance = shift_row[4] if shift_row else 15
-
-                                if shift_checkin_str and not shift_is_next_day:
-                                    await cur.execute(
-                                        "SELECT checkin_time FROM attendances WHERE user_id = %s AND attendance_date = %s",
-                                        (user_id, att_date),
-                                    )
-                                    existing_att = await cur.fetchone()
-                                    if not existing_att:  # Tap pertama = check-in
-                                        try:
-                                            sched_cin = datetime.strptime(
-                                                f"{att_date} {shift_checkin_str}:00", "%Y-%m-%d %H:%M:%S"
-                                            )
-                                            diff_min = int((dt_obj - sched_cin).total_seconds() / 60)
-                                            if diff_min > tolerance:
-                                                late_minutes = diff_min - tolerance
-                                                is_late = 1
-                                                attendance_status = 'TL1' if late_minutes <= 30 else ('TL2' if late_minutes <= 60 else 'TL3')
-                                            logger.info(f"[LATE-CALC] PIN={pin} | Jadwal={shift_checkin_str} | Tap={dt_obj.strftime('%H:%M')} | Terlambat={late_minutes}m | Status={attendance_status}")
-                                        except Exception as e_late:
-                                            logger.warning(f"[LATE-CALC] Gagal hitung: {e_late}")
-
-                                # [UPSERT] Simpan atau update tabel attendances
-                                await cur.execute(
-                                    "SELECT attendance_id, checkin_time, checkout_time FROM attendances WHERE user_id = %s AND attendance_date = %s",
-                                    (user_id, att_date),
-                                )
-                                att_ex = await cur.fetchone()
-                                if not att_ex:
-                                    await cur.execute(
-                                        """
-                                        INSERT INTO attendances 
-                                            (user_id, shift_id, attendance_date, checkin_time, checkout_time,
-                                             attendance_method, attendance_status, late_minutes, is_late, updated_at)
-                                        VALUES (%s, %s, %s, %s, %s, 'FINGER', %s, %s, %s, NOW())
-                                        """,
-                                        (
-                                            user_id, shift_id, att_date, dt_obj,
-                                            dt_obj if status == 1 else None,
-                                            attendance_status, late_minutes, is_late,
-                                        ),
-                                    )
-                                else:
-                                    att_id, cin_time, cout_time = att_ex
-                                    if cin_time:
-                                        diff_sec = (dt_obj - cin_time).total_seconds()
-                                        if diff_sec >= 30:
-                                            if not cout_time or dt_obj >= cout_time:
-                                                working_min = max(0, int((dt_obj - cin_time).total_seconds() / 60))
-                                                await cur.execute(
-                                                    """
-                                                    UPDATE attendances 
-                                                    SET checkout_time = %s, working_minutes = %s, updated_at = NOW()
-                                                    WHERE attendance_id = %s
-                                                    """,
-                                                    (dt_obj, working_min, att_id),
-                                                )
-                                                logger.info(f"[CHECKOUT] PIN={pin} | Pulang={dt_obj.strftime('%H:%M')} | Durasi={working_min}m")
-
-                    except Exception as e:
-                        logger.error(f"[AUTO SYNC ATTENDANCE ERROR] {e}", exc_info=True)
+                    except Exception as e_att:
+                        logger.error(f"[ATTENDANCE PROCESS ERROR] Gagal proses presensi PIN={pin}: {e_att}", exc_info=True)
 
     # Respon ACK standar Protokol EBKN / FkWeb:
     response_headers = {

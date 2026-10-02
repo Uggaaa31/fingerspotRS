@@ -16,6 +16,7 @@ from fastapi.responses import PlainTextResponse
 
 from app.config import settings
 from app.database import get_db_pool
+from app.services.attendance_service import process_attendance_record
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +183,7 @@ async def adms_receive_data(
                             saved_count += 1
 
                             # 2. Otomatisasi update ke tabel attendances (SatuTalenta / Presensi)
-                            await _process_attendance_record(cur, pin, timestamp_str, status)
+                            await _process_attendance_record(cur, pin, timestamp_str, status, device_sn=SN)
 
                             logger.info(
                                 f"[TAP REALTIME] SN={SN} | PIN={pin} | Jam={timestamp_str} | Status={status}"
@@ -269,114 +270,22 @@ async def adms_receive_data(
     return PlainTextResponse("OK", media_type="text/plain")
 
 
-async def _process_attendance_record(cur, pin: str, timestamp_str: str, status: int):
+async def _process_attendance_record(cur, pin: str, timestamp_str: str, status: int, device_sn: str = ""):
     """
-    Memetakan PIN mesin ke pegawai dan melakukan upsert ke tabel attendances.
+    Memetakan PIN mesin ke pegawai dan memproses presensi terpadu via attendance_service (Single Source of Truth).
     """
     try:
-        dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return
-
-    att_date = dt.date()
-
-    # 1. Cari user_id: periksa pin_employee_map
-    await cur.execute("SELECT employee_id FROM pin_employee_map WHERE pin = %s", (pin,))
-    row = await cur.fetchone()
-
-    user_id = None
-    if row:
-        user_id = row[0]
-    else:
-        # Fallback: cari di tabel users (berdasarkan national_id_number atau user_id langsung)
-        await cur.execute(
-            "SELECT user_id FROM users WHERE national_id_number = %s OR user_id = %s LIMIT 1",
-            (pin, pin if pin.isdigit() else -1),
+        return await process_attendance_record(
+            cur=cur,
+            device_sn=device_sn,
+            pin=pin,
+            timestamp_str_or_dt=timestamp_str,
+            status=status,
+            attendance_method="FINGER",
         )
-        user_row = await cur.fetchone()
-        if user_row:
-            user_id = user_row[0]
-
-    if not user_id:
-        logger.info(f"[ATTENDANCE] PIN {pin} belum terpetakan ke pegawai manapun. Silakan petakan melalui Dashboard.")
-        return
-
-    # 2. Logika Penentuan Tanggal Absensi (Shift Malam & Lintas Hari)
-    target_date = att_date
-    yesterday_date = target_date - timedelta(days=1)
-    
-    # Mencoba membaca jadwal shift dari database staging
-    try:
-        # Cek apakah user punya jadwal shift malam KEMARIN (is_next_day = 1)
-        await cur.execute("""
-            SELECT s.shift_id, s.is_next_day, s.checkout_time
-            FROM user_shift_schedules uss 
-            JOIN shifts s ON uss.shift_id = s.shift_id 
-            WHERE uss.user_id = %s AND uss.schedule_date = %s
-        """, (user_id, yesterday_date))
-        yesterday_shift = await cur.fetchone()
-        
-        # Jika kemarin ada shift malam (is_next_day = 1)
-        if yesterday_shift and yesterday_shift[1] == 1:
-            # Shift malam berakhir di hari berikutnya (hari ini).
-            # Kita beri toleransi batas waktu pulang hingga jam 14:00 (atau fleksibel).
-            if dt.hour < 14:
-                # Periksa apakah dia sudah melakukan Check-in hari ini (untuk shift hari ini)
-                await cur.execute("SELECT checkin_time FROM attendances WHERE user_id = %s AND attendance_date = %s", (user_id, target_date))
-                today_att = await cur.fetchone()
-                
-                # Jika belum ada record untuk HARI INI, maka tap di pagi hari ini adalah PULANG untuk shift KEMARIN.
-                if not today_att:
-                    target_date = yesterday_date
-        else:
-            # Fallback (Jika jadwal tidak terdaftar, tapi dia tap jam 00:00 s.d 09:00 pagi)
-            # Dan dia punya Check-in kemarin yang belum di-checkout.
-            if dt.hour < 10:
-                await cur.execute("""
-                    SELECT attendance_id, checkin_time, checkout_time 
-                    FROM attendances 
-                    WHERE user_id = %s AND attendance_date = %s
-                """, (user_id, yesterday_date))
-                yesterday_att = await cur.fetchone()
-                
-                # Jika kemarin punya checkin, tapi belum punya checkout, anggap ini checkout untuk kemarin
-                if yesterday_att and yesterday_att[1] and not yesterday_att[2]:
-                    # Cek juga apakah dia sudah punya absen hari ini
-                    await cur.execute("SELECT attendance_id FROM attendances WHERE user_id = %s AND attendance_date = %s", (user_id, target_date))
-                    today_att_check = await cur.fetchone()
-                    if not today_att_check:
-                        target_date = yesterday_date
-
     except Exception as e:
-        logger.error(f"[SHIFT LOGIC ERROR] {e}")
-        pass
-
-    # 3. Upsert ke tabel attendances (Logika Double Tap -> Waktu Awal & Akhir)
-    await cur.execute(
-        "SELECT attendance_id, checkin_time, checkout_time FROM attendances WHERE user_id = %s AND attendance_date = %s",
-        (user_id, target_date),
-    )
-    existing = await cur.fetchone()
-
-    if not existing:
-        # Tap paling awal -> Check-in
-        await cur.execute(
-            """
-            INSERT INTO attendances 
-                (user_id, attendance_date, checkin_time, attendance_method, attendance_status, updated_at)
-            VALUES (%s, %s, %s, 'FINGER', 'HADIR', NOW())
-            """,
-            (user_id, target_date, dt),
-        )
-    else:
-        # Tap selanjutnya -> Timpa Check-out dengan waktu paling akhir (MAX)
-        att_id, checkin_time, _ = existing
-        # Hanya timpa jika tap berikutnya berjarak minimal 5 menit dari Check-in (mencegah double tap cepat)
-        if checkin_time and dt > checkin_time and (dt - checkin_time).total_seconds() > 300:
-            await cur.execute(
-                "UPDATE attendances SET checkout_time = %s, updated_at = NOW() WHERE attendance_id = %s",
-                (dt, att_id),
-            )
+        logger.error(f"[ADMS ATTENDANCE PROCESS ERROR] PIN={pin}: {e}", exc_info=True)
+        return None
 
 
 # ── 3. COMMAND POLLING (Perintah ke Mesin) ─────────────────────────────────────

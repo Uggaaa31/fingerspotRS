@@ -3,7 +3,7 @@ import {
   Fingerprint, MonitorSmartphone, LayoutList, CalendarDays, 
   RefreshCcw, Database, FileClock, Activity, User, Bell, ChevronRight,
   Search, SlidersHorizontal, Download, HardDrive, Wifi, ShieldAlert,
-  CheckCircle2, XCircle, Clock, BadgeInfo
+  CheckCircle2, XCircle, Clock, BadgeInfo, Hand, ScanFace, CreditCard, KeyRound
 } from 'lucide-react';
 import './index.css';
 
@@ -21,6 +21,8 @@ function App() {
   const [mappingSearchQuery, setMappingSearchQuery] = useState('');
   const [dedupEnabled, setDedupEnabled] = useState(true);
   const [summaryDate, setSummaryDate] = useState(new Date().toISOString().split("T")[0]);
+  const [sseConnected, setSseConnected] = useState(false);
+  const [recentPunchId, setRecentPunchId] = useState(null);
   
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [mapPin, setMapPin] = useState('');
@@ -84,14 +86,77 @@ function App() {
     } catch (err) { console.error(err); }
   };
 
+  // Server-Sent Events (SSE) Real-Time Connection
+  useEffect(() => {
+    let es = null;
+    let reconnectTimer = null;
+
+    const connectSSE = () => {
+      try {
+        es = new EventSource(`${API_BASE}/api/v1/stream`);
+
+        es.onopen = () => {
+          setSseConnected(true);
+        };
+
+        es.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload.event === "connected") {
+              setSseConnected(true);
+              if (payload.stats) setStats(payload.stats);
+            } else if (payload.event === "punch") {
+              const punch = payload.data;
+              if (punch) {
+                playChime();
+                setRecentPunchId(punch.id);
+                setTimeout(() => setRecentPunchId(null), 4000);
+
+                setRecords(prev => {
+                  const exists = prev.some(r => r.id === punch.id || (r.pin === punch.pin && r.timestamp === punch.timestamp));
+                  if (exists) {
+                    return prev.map(r => (r.id === punch.id || (r.pin === punch.pin && r.timestamp === punch.timestamp)) ? punch : r);
+                  }
+                  return [punch, ...prev.slice(0, 99)];
+                });
+              }
+              if (payload.stats) {
+                setStats(payload.stats);
+              }
+            }
+          } catch (e) {
+            console.error("[SSE] JSON parse error", e);
+          }
+        };
+
+        es.onerror = () => {
+          setSseConnected(false);
+          if (es) es.close();
+          reconnectTimer = setTimeout(connectSSE, 3000);
+        };
+      } catch (err) {
+        setSseConnected(false);
+        reconnectTimer = setTimeout(connectSSE, 3000);
+      }
+    };
+
+    connectSSE();
+
+    return () => {
+      if (es) es.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+    };
+  }, []);
+
+  // Inisialisasi awal & sinkronisasi pasif latar belakang (60s fallback, bukan 2.5s)
   useEffect(() => {
     fetchLiveFeed();
     fetchDailySummary();
     fetchMappings();
     const interval = setInterval(() => {
-      fetchLiveFeed();
       fetchMappings();
-    }, 2500);
+      fetchDailySummary();
+    }, 60000);
     return () => clearInterval(interval);
   }, [dedupEnabled, summaryDate]);
 
@@ -129,6 +194,43 @@ function App() {
     const loc = (item.location || "").toLowerCase();
     return name.includes(q) || nik.includes(q) || loc.includes(q);
   });
+
+  const renderVerifyBadge = (label, code) => {
+    const lbl = (label || "").toLowerCase();
+    if (lbl.includes("vena") || lbl.includes("telapak") || lbl.includes("palm") || code === 8 || code === 5) {
+      return (
+        <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-purple-700 bg-purple-50 px-2 py-0.5 rounded border border-purple-200/60 shadow-xs">
+          <Hand size={13} className="text-purple-600"/> Vena Telapak
+        </span>
+      );
+    }
+    if (lbl.includes("wajah") || lbl.includes("face") || code === 2) {
+      return (
+        <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-sky-700 bg-sky-50 px-2 py-0.5 rounded border border-sky-200/60 shadow-xs">
+          <ScanFace size={13} className="text-sky-600"/> Wajah
+        </span>
+      );
+    }
+    if (lbl.includes("kartu") || lbl.includes("rfid") || lbl.includes("card") || code === 4) {
+      return (
+        <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200/60 shadow-xs">
+          <CreditCard size={13} className="text-amber-600"/> Kartu RFID
+        </span>
+      );
+    }
+    if (lbl.includes("pin") || lbl.includes("password") || code === 3) {
+      return (
+        <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-slate-700 bg-slate-100 px-2 py-0.5 rounded border border-slate-200/60 shadow-xs">
+          <KeyRound size={13} className="text-slate-500"/> Password/PIN
+        </span>
+      );
+    }
+    return (
+      <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-slate-700 bg-slate-50 px-2 py-0.5 rounded border border-slate-200/60 shadow-xs">
+        <Fingerprint size={13} className="text-slate-500"/> Sidik Jari
+      </span>
+    );
+  };
 
   const filteredMappings = pinMappings.filter(item => {
     const q = mappingSearchQuery.toLowerCase();
@@ -185,7 +287,7 @@ function App() {
           <div className="flex items-center gap-6">
             <div className="flex flex-col">
               <h1 className="font-bold text-[15px] text-slate-900 leading-tight">Fingerspot ADMS Middleware</h1>
-              <span className="text-xs text-slate-500 font-medium">Penghubung HRIS RS v2.4</span>
+              <span className="text-xs text-slate-500 font-medium">Revo WFV-208BNC • RSUP Biometrik Gateway</span>
             </div>
             
             <div className="h-6 w-px bg-slate-200"></div>
@@ -199,9 +301,18 @@ function App() {
                 <span>Jeda Sinkronisasi:</span>
                 <span className="text-slate-800 font-bold">120ms</span>
               </div>
-              <div className="flex items-center gap-1.5 text-slate-700">
-                <span className="w-1.5 h-1.5 rounded-full bg-blue-500"></span>
-                WebSocket Terhubung
+              <div className="flex items-center gap-1.5">
+                {sseConnected ? (
+                  <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                    SSE Real-Time Aktif
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-700 bg-amber-50 px-2.5 py-1 rounded-full border border-amber-200">
+                    <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping"></span>
+                    Menghubungkan SSE...
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -373,7 +484,7 @@ function App() {
                     <div className="bg-[#eff6ff] rounded-xl p-3 flex items-start gap-3 border border-blue-100">
                       <div className="mt-0.5"><span className="w-2 h-2 rounded-full bg-blue-600 block"></span></div>
                       <div className="text-xs font-medium text-slate-700 flex-1">
-                        Menampilkan aliran langsung biometrik ADMS ZKTeco. Diperbarui otomatis melalui WebSocket tanpa memuat ulang halaman.
+                        Menampilkan aliran biometrik ADMS secara real-time via Server-Sent Events (SSE). Terkoneksi langsung dengan 0ms latency.
                       </div>
                     </div>
                   </div>
@@ -406,11 +517,11 @@ function App() {
                         {filteredRecords.map((item, i) => {
                           const isCheckIn = item.status_code === 0;
                           const timeDiff = Math.floor((new Date() - new Date(item.received_at)) / 1000);
-                          const isNew = timeDiff < 6;
+                          const isNew = item.id === recentPunchId || timeDiff < 6;
                           const initials = (item.employee_name || "👤").replace(/^(dr\.|drg\.|Ns\.|H\.|Hj\.)\s*/i, "").split(' ').map(n=>n[0]).join('').substring(0,2).toUpperCase();
                           
                           return (
-                            <tr key={item.id} className="hover:bg-slate-50/50 transition-colors group">
+                            <tr key={item.id} className={`transition-all duration-700 ${item.id === recentPunchId ? 'bg-emerald-50/70 ring-1 ring-emerald-300' : 'hover:bg-slate-50/50'} group`}>
                               <td className="py-3 px-4">
                                 <div className="flex items-center gap-3">
                                   <div className={`w-9 h-9 rounded-full flex items-center justify-center text-xs font-bold ${isNew ? 'bg-blue-500 text-white shadow-md' : 'bg-white border border-slate-200 text-slate-600 shadow-sm'}`}>
@@ -445,9 +556,7 @@ function App() {
                                 )}
                               </td>
                               <td className="py-3 px-4">
-                                <span className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-600">
-                                  <Fingerprint size={14} className="text-slate-400"/> {item.verify_label}
-                                </span>
+                                {renderVerifyBadge(item.verify_label, item.verify_code)}
                               </td>
                               <td className="py-3 px-4">
                                 <div className="flex flex-col">
@@ -475,15 +584,18 @@ function App() {
                       <Download size={14}/> Ekspor Data (Excel)
                     </button>
                   </div>
-                  <div className="overflow-x-auto">
+                    <div className="overflow-x-auto">
                     <table className="w-full text-left border-t border-slate-200 whitespace-nowrap">
                       <thead>
                         <tr className="bg-slate-50 text-[10px] font-extrabold text-slate-500 uppercase tracking-widest">
                           <th className="py-3 px-4 w-12 text-center">No</th>
                           <th className="py-3 px-4">Pegawai & NIK</th>
+                          <th className="py-3 px-4">Shift</th>
                           <th className="py-3 px-4">Jam Masuk</th>
+                          <th className="py-3 px-4">Keterlambatan</th>
                           <th className="py-3 px-4">Jam Pulang</th>
-                          <th className="py-3 px-4">Durasi / Status</th>
+                          <th className="py-3 px-4">Pulang Cepat</th>
+                          <th className="py-3 px-4">Durasi & Status</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
@@ -497,16 +609,45 @@ function App() {
                               </div>
                             </td>
                             <td className="py-3 px-4">
+                              <span className="inline-flex items-center text-xs font-bold text-slate-700 bg-slate-100 px-2.5 py-1 rounded-md border border-slate-200">
+                                {item.shift_name || "Reguler"}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4">
                               <span className="text-sm font-bold text-teal-700">{item.checkin_time ? formatTime(item.checkin_time) : '-'}</span>
                             </td>
                             <td className="py-3 px-4">
-                              <span className="text-sm font-bold text-red-600">{item.checkout_time ? formatTime(item.checkout_time) : '-'}</span>
+                              {item.late_level ? (
+                                <span className="inline-flex items-center gap-1 text-[11px] font-bold text-amber-800 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">
+                                  ⚠️ {item.late_desc}
+                                </span>
+                              ) : (
+                                <span className="text-xs font-semibold text-slate-400">
+                                  {item.checkin_time ? "✅ Tepat Waktu" : "-"}
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3 px-4">
+                              <span className="text-sm font-bold text-slate-800">{item.checkout_time ? formatTime(item.checkout_time) : '-'}</span>
+                            </td>
+                            <td className="py-3 px-4">
+                              {item.early_leave_level ? (
+                                <span className="inline-flex items-center gap-1 text-[11px] font-bold text-orange-800 bg-orange-50 px-2 py-0.5 rounded border border-orange-200">
+                                  ⏳ {item.early_leave_desc}
+                                </span>
+                              ) : (
+                                <span className="text-xs font-semibold text-slate-400">
+                                  {item.checkout_time ? "Sesuai Jadwal" : "-"}
+                                </span>
+                              )}
                             </td>
                             <td className="py-3 px-4">
                               <div className="flex flex-col items-start gap-1">
                                 <span className="text-xs font-bold text-slate-700">{item.duration || '-'}</span>
                                 <div className="flex items-center gap-1">
-                                  <span className="inline-flex items-center gap-1 text-[10px] font-bold text-slate-600 bg-slate-100 px-2 py-0.5 rounded border border-slate-200">{item.status || item.attendance_status}</span>
+                                  <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded border ${item.status?.startsWith('TL') ? 'bg-amber-100 text-amber-800 border-amber-200' : 'bg-slate-100 text-slate-700 border-slate-200'}`}>
+                                    {item.status || item.attendance_status}
+                                  </span>
                                   {item.attendance_method && (
                                     <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded border ${item.attendance_method.toUpperCase() === 'FINGER' ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-purple-50 text-purple-700 border-purple-200'}`}>
                                       {item.attendance_method}

@@ -66,7 +66,7 @@ async def ensure_adms_tables(pool_instance):
         """,
         """
         CREATE TABLE IF NOT EXISTS `pin_employee_map` (
-            `pin` VARCHAR(20) PRIMARY KEY,
+            `pin` VARCHAR(32) PRIMARY KEY,
             `employee_id` BIGINT NOT NULL
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
         """,
@@ -74,7 +74,7 @@ async def ensure_adms_tables(pool_instance):
         CREATE TABLE IF NOT EXISTS `raw_attendance` (
             `id` BIGINT AUTO_INCREMENT PRIMARY KEY,
             `device_sn` VARCHAR(50),
-            `pin` VARCHAR(20),
+            `pin` VARCHAR(32),
             `timestamp` DATETIME,
             `status` INT DEFAULT 0,
             `verify_mode` INT DEFAULT 1,
@@ -95,7 +95,7 @@ async def ensure_adms_tables(pool_instance):
         """,
         """
         CREATE TABLE IF NOT EXISTS `biometric_templates` (
-            `pin` VARCHAR(20),
+            `pin` VARCHAR(32),
             `finger_id` INT,
             `template_type` VARCHAR(20) DEFAULT 'FP',
             `valid` INT DEFAULT 1,
